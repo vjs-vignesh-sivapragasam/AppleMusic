@@ -59,7 +59,20 @@
         {
           "enableBackgroundPlayback": true
         }
-      ]
+      ],
+      [
+        "expo-build-properties",
+        {
+          "ios": {
+            "deploymentTarget": "15.1"
+          },
+          "android": {
+            "newArchEnabled": false
+          }
+        }
+      ],
+      "expo-font",
+      "expo-asset"
     ],
     "extra": {
       "eas": {
