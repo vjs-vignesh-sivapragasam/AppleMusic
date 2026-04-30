@@ -63,10 +63,16 @@
       [
         "expo-build-properties",
         {
-          "ios": { "deploymentTarget": "15.0" },
-          "android": { "newArchEnabled": false }
+          "ios": {
+            "deploymentTarget": "15.1"
+          },
+          "android": {
+            "newArchEnabled": false
+          }
         }
-      ]
+      ],
+      "expo-font",
+      "expo-asset"
     ],
     "extra": {
       "eas": {
