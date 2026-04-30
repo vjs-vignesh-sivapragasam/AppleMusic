@@ -1,3 +1,4 @@
+import 'expo-dev-client';
 import 'react-native-gesture-handler';
 import { Buffer } from 'buffer';
 
@@ -11,5 +12,8 @@ if (global.process && !global.process.nextTick) {
 
 import { registerRootComponent } from 'expo';
 import App from './App';
+import TrackPlayer from 'react-native-track-player';
+import { PlaybackService } from './src/services/playbackService';
 
 registerRootComponent(App);
+TrackPlayer.registerPlaybackService(() => PlaybackService);

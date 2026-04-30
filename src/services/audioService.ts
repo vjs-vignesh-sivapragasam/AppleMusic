@@ -1,4 +1,10 @@
-import { createAudioPlayer, setAudioModeAsync, AudioPlayer, AudioStatus } from 'expo-audio';
+import TrackPlayer, { 
+  Capability, 
+  State, 
+  Event, 
+  AppKilledPlaybackBehavior,
+  Capability as RemoteControlCapability
+} from 'react-native-track-player';
 import { AppState } from 'react-native';
 import * as FileSystem from 'expo-file-system/legacy';
 import { Song } from '../types';
@@ -9,9 +15,9 @@ import { usePlayerStore, useSettingsStore } from '../store';
 const CACHE_DIR = `${FileSystem.cacheDirectory}music-cache/`;
 
 class AudioService {
-  private player:  AudioPlayer | null = null;
-  private song:    Song | null = null;
-  private appSub:  any = null;
+  private isInitialized = false;
+  private initPromise: Promise<void> | null = null;
+  private appSub: any = null;
 
   // Simple debounce: ignore status-driven isPlaying writes for 500ms after
   // a manual play/pause so the icon doesn't flicker back.
@@ -21,56 +27,128 @@ class AudioService {
 
   // ─── Init ──────────────────────────────────────────────────────────────────
   async initialize(): Promise<void> {
-    try {
-      await setAudioModeAsync({
-        playsInSilentMode:      true,
-        shouldPlayInBackground: true,
-        interruptionMode:       'doNotMix',
-        allowsRecording:        false,
-      });
-      this.appSub = AppState.addEventListener('change', () => {});
-      const info = await FileSystem.getInfoAsync(CACHE_DIR);
-      if (!info.exists) await FileSystem.makeDirectoryAsync(CACHE_DIR, { intermediates: true });
-    } catch (e) {
-      console.error('[Audio] initialize error:', e);
-    }
+    if (this.isInitialized) return;
+    if (this.initPromise) return this.initPromise;
+
+    this.initPromise = (async () => {
+      try {
+        console.log('[Audio] Starting TrackPlayer setup...');
+        try {
+          await TrackPlayer.setupPlayer({
+            waitForBuffer: true,
+          });
+        } catch (e: any) {
+          // If already initialized, we can just proceed
+          if (e.message?.includes('already initialized')) {
+            console.log('[Audio] TrackPlayer already initialized');
+          } else {
+            throw e;
+          }
+        }
+
+        await TrackPlayer.updateOptions({
+          android: {
+            appKilledPlaybackBehavior: AppKilledPlaybackBehavior.StopPlaybackAndRemoveNotification,
+          },
+          capabilities: [
+            Capability.Play,
+            Capability.Pause,
+            Capability.SkipToNext,
+            Capability.SkipToPrevious,
+            Capability.SeekTo,
+            Capability.Stop,
+          ],
+          compactCapabilities: [
+            Capability.Play,
+            Capability.Pause,
+            Capability.SkipToNext,
+          ],
+          notificationCapabilities: [
+            Capability.Play,
+            Capability.Pause,
+            Capability.SkipToNext,
+            Capability.SkipToPrevious,
+            Capability.Stop,
+            Capability.SeekTo,
+          ],
+        });
+
+        // Subscribe to track changes
+        TrackPlayer.addEventListener(Event.PlaybackActiveTrackChanged, (event) => {
+          if (event.track) {
+            usePlayerStore.setState({ duration: (event.track.duration || 0) * 1000 });
+          }
+        });
+
+        this.appSub = AppState.addEventListener('change', () => {});
+        const info = await FileSystem.getInfoAsync(CACHE_DIR);
+        if (!info.exists) await FileSystem.makeDirectoryAsync(CACHE_DIR, { intermediates: true });
+
+        // Subscribe to playback state changes to sync with Zustand
+        TrackPlayer.addEventListener(Event.PlaybackState, (event) => {
+          if (this._locked()) return;
+          const isPlaying = event.state === State.Playing;
+          usePlayerStore.setState({ isPlaying });
+        });
+
+        // Periodically sync progress
+        setInterval(async () => {
+          try {
+            if (await TrackPlayer.getState() === State.Playing) {
+              const position = await TrackPlayer.getPosition();
+              const duration = await TrackPlayer.getDuration();
+              usePlayerStore.setState({ 
+                currentTime: position * 1000,
+                duration: duration * 1000
+              });
+            }
+          } catch {}
+        }, 1000);
+
+        this.isInitialized = true;
+        console.log('[Audio] ✓ TrackPlayer initialization complete');
+      } catch (e) {
+        console.error('[Audio] ✗ Initialize error:', e);
+        this.initPromise = null; // allow retry
+        throw e;
+      }
+    })();
+
+    return this.initPromise;
   }
 
   // ─── Load & Play ───────────────────────────────────────────────────────────
   async loadAndPlay(song: Song): Promise<void> {
     try {
-      // 1. Update store immediately so UI shows new song + pause icon right away
-      usePlayerStore.setState({ currentSong: song, isPlaying: true, currentTime: 0, duration: 0 });
-      this._lock(); // prevent status ticks from overwriting isPlaying during load
-
-      // 2. Tear down old player
-      if (this.player) {
-        try { this.player.pause(); } catch {}
-        try { this.player.remove(); } catch {}
-        this.player = null;
+      console.log(`[Audio] Loading song: ${song.title}`);
+      if (!this.isInitialized) {
+        await this.initialize();
       }
-      this.song = song;
 
-      // 3. Resolve source
+      // 1. Update store immediately
+      usePlayerStore.setState({ currentSong: song, isPlaying: true, currentTime: 0 });
+      this._lock();
+
+      // 2. Resolve source
       const source = await this._resolveSource(song);
+      console.log(`[Audio] Source resolved: ${source.uri.substring(0, 50)}...`);
 
-      // 4. Create player
-      this.player = createAudioPlayer(source, {
-        keepAudioSessionActive: true,
-        updateInterval: 1000, // 1s ticks — only needed for progress bar
+      // 3. Reset and Add to TrackPlayer
+      await TrackPlayer.reset();
+      await TrackPlayer.add({
+        id: song.id,
+        url: source.uri,
+        title: song.title,
+        artist: song.artist,
+        album: song.album || 'Unknown Album',
+        artwork: song.artwork && song.artwork.startsWith('http') ? song.artwork : undefined,
+        duration: song.duration ? song.duration / 1000 : undefined,
+        headers: source.headers,
       });
-      this.player.addListener('playbackStatusUpdate', this._onStatus.bind(this));
-      this.player.play();
 
-      // 5. Lock screen metadata
-      if (typeof this.player.setActiveForLockScreen === 'function') {
-        this.player.setActiveForLockScreen(true, {
-          title:      song.title  || 'Unknown',
-          artist:     song.artist || 'Unknown',
-          albumTitle: song.album  || '',
-          artworkUrl: song.artwork || '',
-        }, { showSeekBackward: true, showSeekForward: true });
-      }
+      // 4. Play
+      await TrackPlayer.play();
+      console.log('[Audio] Play command sent');
     } catch (err) {
       console.error('[Audio] loadAndPlay error:', err);
       usePlayerStore.setState({ isPlaying: false });
@@ -102,98 +180,52 @@ class AudioService {
     }
 
     if (song.source === 'google-drive') {
-      // 1. Check local file first (offline download)
       if (song.localUri) {
         try {
           const info = await FileSystem.getInfoAsync(song.localUri);
           if (info.exists) return { uri: song.localUri };
         } catch {}
       }
-      // 2. Check JIT cache
       const cached = await this._getCached(song.id);
       if (cached) return { uri: cached };
 
-      // 3. Stream from Drive — embed token as query param so iOS AVPlayer picks it up
-      //    (iOS ignores custom headers on direct media URLs in AVFoundation)
       if (!url) throw new Error(`[Audio] No URL for song: ${song.title}`);
       const token = await googleDriveService.getAccessToken();
       if (!token) throw new Error('No Google Drive token — please reconnect');
-      // Append token to URL; avoids the custom-header limitation on iOS
       const authedUri = url.includes('?')
         ? `${url}&access_token=${encodeURIComponent(token)}`
         : `${url}?access_token=${encodeURIComponent(token)}`;
-      // Also background-cache for next play
       this._cacheInBg(song, token);
       return { uri: authedUri };
     }
 
-    // offline / streaming-url / default
     if (!url) throw new Error(`[Audio] No URL for song: ${song.title}`);
     return { uri: url };
   }
 
-  // ─── Status callback — batched single setState ────────────────────────────
-  private _onStatus(status: AudioStatus): void {
-    if (!status.isLoaded) return; // ignore pre-load ticks
-
-    const update: Record<string, any> = {
-      currentTime: (status.currentTime || 0) * 1000,
-      duration:    (status.duration    || 0) * 1000,
-    };
-
-    // Only sync isPlaying from engine when not in manual-toggle lock window
-    if (!this._locked()) {
-      update.isPlaying = status.playing;
-    }
-
-    // Single setState = single re-render
-    usePlayerStore.setState(update);
-
-    if (status.didJustFinish) this._onFinish();
-  }
-
-  private _onFinish(): void {
-    const { repeat, playNext, currentSong } = usePlayerStore.getState();
-    if (repeat === 'one') {
-      this.seekTo(0);
-      this.play();
-      return;
-    }
-    playNext();
-    const next = usePlayerStore.getState().currentSong;
-    if (next && next.id !== currentSong?.id) this.loadAndPlay(next);
-  }
-
   // ─── Controls ─────────────────────────────────────────────────────────────
-  play(): void {
-    if (!this.player) return;
+  async play(): Promise<void> {
     this._lock();
-    this.player.play();
+    await TrackPlayer.play();
     usePlayerStore.setState({ isPlaying: true });
   }
 
-  pause(): void {
-    if (!this.player) return;
+  async pause(): Promise<void> {
     this._lock();
-    this.player.pause();
+    await TrackPlayer.pause();
     usePlayerStore.setState({ isPlaying: false });
   }
 
   async seekTo(ms: number): Promise<void> {
-    if (this.player) await this.player.seekTo(ms / 1000);
+    await TrackPlayer.seekTo(ms / 1000);
   }
 
   async setVolume(v: number): Promise<void> {
-    if (this.player) this.player.volume = v;
+    await TrackPlayer.setVolume(v);
   }
 
   async unload(): Promise<void> {
-    if (this.player) {
-      try { this.player.pause(); } catch {}
-      try { this.player.remove(); } catch {}
-      this.player = null;
-    }
-    this.song = null;
+    await TrackPlayer.reset();
     if (this.appSub) { this.appSub.remove(); this.appSub = null; }
   }
 
@@ -206,8 +238,6 @@ class AudioService {
       }
     } catch {}
   }
-
-  getCurrentSong(): Song | null { return this.song; }
 
   // ─── Cache helpers ────────────────────────────────────────────────────────
   private async _getCached(id: string): Promise<string | null> {
