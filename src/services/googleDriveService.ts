@@ -45,7 +45,9 @@ class GoogleDriveService {
 
   async connect(): Promise<{ success: boolean; error?: string }> {
     try {
-      const returnUrl = AuthSession.makeRedirectUri();
+      const returnUrl = AuthSession.makeRedirectUri({
+        scheme: 'applesmusicplayer',
+      });
       const exactRedirectUri = `https://auth.expo.io/${PROJECT_FULL_NAME}`;
 
       // Request offline access so we get a refresh_token
